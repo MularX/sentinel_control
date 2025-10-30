@@ -10,7 +10,7 @@ from matplotlib.colors import ListedColormap
 from scipy.ndimage import binary_dilation, binary_fill_holes
 from collections import deque
 import time
-from rclpy.parameter import Parameter # Importuj Parameter
+from rclpy.parameter import Parameter
 
 import tf2_ros
 from tf2_ros import TransformException
@@ -19,20 +19,18 @@ class MapDisplayNode(Node):
     def __init__(self):
         super().__init__('map_display_node')
         
-        # sim time
         self.set_parameters([Parameter('use_sim_time', value=True)])
 
-        # planowanie 
-        self.pole_przeszkody = 8  # 10
+        self.pole_przeszkody = 8
         self.min_klaster_rozmiar_pocz = 5
         self.min_klaster_rozmiar = self.min_klaster_rozmiar_pocz
-        self.min_goal_distance = 30 # odleglosc pomiedzy celami
+        self.min_goal_distance = 30
+        self.frontier_min_unknown_neighbors = 3
 
         self.exploration_phase = 1
         self.mission_completed = False
         self.initial_robot_position = None 
 
-        # zmienee do wykrywania utkniecia
         self.stuck_check_interval = 1.0
         self.stuck_timeout = 5.0
         self.last_known_position = None
@@ -48,7 +46,6 @@ class MapDisplayNode(Node):
         self.robot_x, self.robot_y = None, None
         self.map_data_raw, self.map_fields_raw = None, None
         self.exploration_points = []
-
 
         self.tf_buffer = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
@@ -66,7 +63,7 @@ class MapDisplayNode(Node):
         self.fig.canvas.mpl_connect('motion_notify_event', self.on_motion)
 
         self.stuck_timer = self.create_timer(self.stuck_check_interval, self.check_if_stuck_callback)
-        self.get_logger().info('Węzeł MapDisplayNode uruchomiony z zaawansowanymi funkcjami i poprawką czasu TF2.')
+        self.get_logger().info('Węzeł MapDisplayNode uruchomiony z poprawioną eksploracją frontier.')
 
     def odom_callback(self, msg):
         if self.mission_completed: return
@@ -74,7 +71,6 @@ class MapDisplayNode(Node):
         to_frame = 'base_link'
 
         try:
-            # OSTATECZNA POPRAWKA CZASU
             t = self.tf_buffer.lookup_transform(from_frame, to_frame, rclpy.time.Time())
             
             self.robot_x = t.transform.translation.x
@@ -165,9 +161,7 @@ class MapDisplayNode(Node):
 
         if not targets_with_info:
             self.exploration_points = []
-
         else:
-
             if self.robot_x is None or self.robot_y is None:
                 self.get_logger().warn("Brak pozycji robota, sortowanie tylko wg zysku.")
                 targets_with_info.sort(key=lambda item: item[1], reverse=True)
@@ -191,13 +185,14 @@ class MapDisplayNode(Node):
                             is_too_close = True
                             break
                     if not is_too_close:
-                        if self._check_path_validity(robot_grid_x, robot_grid_y, cx, cy, self.map_data_raw):
+                        if self._check_path_validity_bfs(robot_grid_x, robot_grid_y, cx, cy, self.map_data_raw):
                             filtered_goals.append((cx, cy))
                         else:
-                            self.get_logger().debug(f"Goal {cx, cy} is unreachable from robot. Skipping.")
+                            self.get_logger().debug(f"Goal ({cx}, {cy}) jest nieosiągalny z pozycji robota. Pomijam.")
+                
                 self.exploration_points = filtered_goals
-
-                self.get_logger().info(f"Top 5 goals after sorting: {[f'({g[0][0]}, {g[0][1]}) dist:{g[1]:.2f} gain:{g[2]}' for g in scored_targets[:5]]}")
+                self.get_logger().info(f"Top 5 celów po sortowaniu: {[f'({g[0][0]}, {g[0][1]}) dist:{g[1]:.2f} gain:{g[2]}' for g in scored_targets[:5]]}")
+        
         self.get_logger().info(f'Faza {self.exploration_phase}: Nowy plan, {len(self.exploration_points)} celów.')
         self.publish_next_goal()
 
@@ -215,31 +210,92 @@ class MapDisplayNode(Node):
         costmap[filled_obstacle_mask] = 100
         self.map_fields_raw = costmap
 
-        fields_msg = OccupancyGrid(); fields_msg.header.stamp = self.get_clock().now().to_msg()
-        fields_msg.header.frame_id = "map"; fields_msg.info = self.map_info
+        fields_msg = OccupancyGrid()
+        fields_msg.header.stamp = self.get_clock().now().to_msg()
+        fields_msg.header.frame_id = "map"
+        fields_msg.info = self.map_info
         fields_msg.data = self.map_fields_raw.flatten().tolist()
         self.map_fields_pub.publish(fields_msg)
 
     def plan_frontier_points_via_clustering(self, map_data):
+        """
+        Find frontier points: free cells (0) adjacent to unknown cells (-1)
+        that are reachable without crossing obstacles.
+        """
         height, width = map_data.shape
         all_frontier_points = []
 
         for r in range(1, height - 1):
             for c in range(1, width - 1):
-                if map_data[r, c] == 0: 
-                    unknown_neighbors = 0
-                    for dr in range(-1, 2):
-                        for dc in range(-1, 2):
-                            if dr == 0 and dc == 0: continue 
-                            nr, nc = r + dr, c + dc
-                            if 0 <= nr < height and 0 <= nc < width and map_data[nr, nc] == -1:
+                if map_data[r, c] != 0:
+                    continue
+                
+                unknown_neighbors = 0
+                has_obstacle_neighbor = False
+                
+                for dr in range(-1, 2):
+                    for dc in range(-1, 2):
+                        if dr == 0 and dc == 0:
+                            continue
+                        nr, nc = r + dr, c + dc
+                        if 0 <= nr < height and 0 <= nc < width:
+                            if map_data[nr, nc] == -1:
                                 unknown_neighbors += 1
-                    
-                    if unknown_neighbors > 0:
-                        all_frontier_points.append(((c, r), unknown_neighbors))
+                            elif map_data[nr, nc] >= 99:  
+                                has_obstacle_neighbor = True
+                
+                if unknown_neighbors >= self.frontier_min_unknown_neighbors and not has_obstacle_neighbor:
+                    all_frontier_points.append(((c, r), unknown_neighbors))
         
-
+        self.get_logger().info(f"Znaleziono {len(all_frontier_points)} punktów frontier.")
         return all_frontier_points
+
+    def _check_path_validity_bfs(self, start_x, start_y, end_x, end_y, map_data):
+        """
+        Use BFS to check if there's a valid path through free space (0)
+        from start to end position. More robust than line-of-sight.
+        """
+        height, width = map_data.shape
+        
+        if not (0 <= start_y < height and 0 <= start_x < width):
+            return False
+        if not (0 <= end_y < height and 0 <= end_x < width):
+            return False
+        
+        if map_data[start_y, start_x] != 0:
+            return False
+        if map_data[end_y, end_x] != 0:
+            return False
+        
+        visited = np.zeros((height, width), dtype=bool)
+        queue = deque([(start_x, start_y)])
+        visited[start_y, start_x] = True
+        
+        directions = [(-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 1), (1, -1), (1, 0), (1, 1)]
+        
+        max_search_distance = int(np.sqrt((end_x - start_x)**2 + (end_y - start_y)**2) * 1.5)
+        search_count = 0
+        max_iterations = 10000
+        
+        while queue and search_count < max_iterations:
+            x, y = queue.popleft()
+            search_count += 1
+            
+            if x == end_x and y == end_y:
+                return True
+            
+            if abs(x - start_x) > max_search_distance or abs(y - start_y) > max_search_distance:
+                continue
+            
+            for dx, dy in directions:
+                nx, ny = x + dx, y + dy
+                
+                if 0 <= nx < width and 0 <= ny < height:
+                    if not visited[ny, nx] and map_data[ny, nx] == 0:
+                        visited[ny, nx] = True
+                        queue.append((nx, ny))
+        
+        return False
 
     def publish_next_goal(self):
         self.time_without_movement = 0.0
@@ -250,6 +306,7 @@ class MapDisplayNode(Node):
                 self.get_logger().warn("Faza 1 zakończona. Brak dużych celów. Przechodzę do Fazy 2 (mniejsze cele).")
                 self.exploration_phase = 2
                 self.min_klaster_rozmiar = int(self.min_klaster_rozmiar_pocz / 2)
+                self.frontier_min_unknown_neighbors = 1  
                 self.replan_and_sort_goals()
                 return
             else:
@@ -270,72 +327,63 @@ class MapDisplayNode(Node):
 
         target_grid_x, target_grid_y = self.exploration_points[0]
         target_world_x, target_world_y = self.convert_grid_to_world(target_grid_x, target_grid_y)
-        goal_msg = PoseStamped(); goal_msg.header.stamp = self.get_clock().now().to_msg()
-        goal_msg.header.frame_id = "map"; goal_msg.pose.position.x = target_world_x
-        goal_msg.pose.position.y = target_world_y; goal_msg.pose.position.z = 0.0
+        goal_msg = PoseStamped()
+        goal_msg.header.stamp = self.get_clock().now().to_msg()
+        goal_msg.header.frame_id = "map"
+        goal_msg.pose.position.x = target_world_x
+        goal_msg.pose.position.y = target_world_y
+        goal_msg.pose.position.z = 0.0
         goal_msg.pose.orientation.w = 1.0
         self.goal_publisher.publish(goal_msg)
-        self.get_logger().info(f"Opublikowano nowy, optymalny cel: ({target_world_x:.2f}, {target_world_y:.2f})")
-
-    def _check_path_validity(self, start_x, start_y, end_x, end_y, map_data):
-        dx = abs(end_x - start_x)
-        dy = abs(end_y - start_y)
-        sx = 1 if start_x < end_x else -1
-        sy = 1 if start_y < end_y else -1
-        err = dx - dy
-
-        x, y = start_x, start_y
-
-        while True:
-            if not (0 <= y < map_data.shape[0] and 0 <= x < map_data.shape[1]):
-                return False 
-            if map_data[y, x] != 0:
-                return False
-
-            if x == end_x and y == end_y:
-                break
-
-            e2 = 2 * err
-            if e2 > -dy:
-                err -= dy
-                x += sx
-            if e2 < dx:
-                err += dx
-                y += sy
-        return True
+        self.get_logger().info(f"Opublikowano nowy cel frontier: ({target_world_x:.2f}, {target_world_y:.2f})")
 
     def is_area_fully_explored(self, center_x, center_y, map_data, radius=10):
-        min_r = max(0, center_y - radius); max_r = min(map_data.shape[0], center_y + radius + 1)
-        min_c = max(0, center_x - radius); max_c = min(map_data.shape[1], center_x + radius + 1)
+        min_r = max(0, center_y - radius)
+        max_r = min(map_data.shape[0], center_y + radius + 1)
+        min_c = max(0, center_x - radius)
+        max_c = min(map_data.shape[1], center_x + radius + 1)
         area = map_data[min_r:max_r, min_c:max_c]
         return not np.any(area == -1)
 
     def update_plot(self):
-        if self.map_data_raw is None or self.map_fields_raw is None or self.map_info is None: return
-        self.ax1.clear(); self.ax2.clear()
+        if self.map_data_raw is None or self.map_fields_raw is None or self.map_info is None:
+            return
+        
+        self.ax1.clear()
+        self.ax2.clear()
+        
         display_map_data = np.vectorize(self.display_mapping_map.get)(self.map_data_raw)
         self.ax1.imshow(display_map_data, cmap=self.cmap_map, vmin=0, vmax=len(self.display_mapping_map)-1, origin='lower')
         self.ax1.set_title(f'/map ({self.map_info.width}x{self.map_info.height})')
-        self.ax1.set_xlabel('X (komórki)'); self.ax1.set_ylabel('Y (komórki)')
+        self.ax1.set_xlabel('X (komórki)')
+        self.ax1.set_ylabel('Y (komórki)')
+        
         display_costmap_data = np.vectorize(self.display_mapping_costmap.get)(self.map_fields_raw)
         self.ax2.imshow(display_costmap_data, cmap=self.cmap_fields, vmin=0, vmax=len(self.display_mapping_costmap)-1, origin='lower')
+        
         if self.mission_completed:
             self.ax2.set_title('Misja Zakończona!')
         else:
             self.ax2.set_title(f'Costmap (Faza {self.exploration_phase}, Pozostało {len(self.exploration_points)} celów)')
-        self.ax2.set_xlabel('X (komórki)'); self.ax2.set_ylabel('Y (komórki)')
+        
+        self.ax2.set_xlabel('X (komórki)')
+        self.ax2.set_ylabel('Y (komórki)')
 
         if self.exploration_points:
             points_x, points_y = zip(*self.exploration_points)
             self.ax2.plot(points_x, points_y, 'b*', markersize=8, label='Pozostałe cele')
             self.ax2.plot(self.exploration_points[0][0], self.exploration_points[0][1], 'r*', markersize=14, label='Aktualny cel')
+        
         if self.robot_x is not None and self.robot_y is not None:
             grid_x = (self.robot_x - self.map_info.origin.position.x) / self.map_info.resolution
             grid_y = (self.robot_y - self.map_info.origin.position.y) / self.map_info.resolution
             if 0 <= grid_x < self.map_info.width and 0 <= grid_y < self.map_info.height:
                 self.ax1.plot(grid_x, grid_y, 'ro', markersize=8)
                 self.ax2.plot(grid_x, grid_y, 'ro', markersize=8, label='Robot')
-        self.ax2.legend(loc='upper right'); plt.draw(); plt.pause(0.01)
+        
+        self.ax2.legend(loc='upper right')
+        plt.draw()
+        plt.pause(0.01)
 
     def convert_grid_to_world(self, grid_x, grid_y):
         world_x = self.map_info.origin.position.x + (grid_x + 0.5) * self.map_info.resolution
@@ -344,7 +392,8 @@ class MapDisplayNode(Node):
 
     def on_motion(self, event):
         if event.inaxes in [self.ax1, self.ax2] and self.map_info:
-            col = int(event.xdata); row = int(event.ydata)
+            col = int(event.xdata)
+            row = int(event.ydata)
             if 0 <= col < self.map_info.width and 0 <= row < self.map_info.height:
                 map_x, map_y = self.convert_grid_to_world(col, row)
                 self.fig.suptitle(f'Kursora: [wiersz: {row}, kol: {col}] | Mapa (x: {map_x:.2f}m, y: {map_y:.2f}m)')

@@ -60,10 +60,10 @@ class GoToGoalNode(Node):
         # Parameters
         self.declare_parameters('', [
             ('working_frame', 'map'),
-            ('linear_speed_limit', 5.0),
-            ('angular_speed_limit', 1.2), # 1.2
-            ('linear_accel_limit', 5.0), # 0.6
-            ('angular_accel_limit', 2.0), # 2.0
+            ('linear_speed_limit', 5.0), #0.35 uwaga na inercje w symulacji
+            ('angular_speed_limit', 5.0),   # 1.2
+            ('linear_accel_limit', 5.0),
+            ('angular_accel_limit', 5.0), # 2.0
             ('k_rho', 1.0),
             ('k_alpha', 2.5),
             ('k_final_yaw', 1.0),
@@ -85,6 +85,7 @@ class GoToGoalNode(Node):
         self.assume_equal = bool(self.get_parameter('assume_map_equals_odom_if_no_tf').value)
         self.working_frame = self.get_parameter('working_frame').get_parameter_value().string_value or 'map'
 
+        # TF2
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
 
@@ -105,7 +106,7 @@ class GoToGoalNode(Node):
                               durability=DurabilityPolicy.TRANSIENT_LOCAL)
         self.sub_goal = self.create_subscription(PoseStamped, '/exploration_goal', self.goal_cb, qos_goal)
 
-        self.current_pose: Optional[tuple] = None
+        self.current_pose: Optional[tuple] = None 
         self.goal_msg: Optional[PoseStamped] = None
         self.goal_reached = True
         self.v_prev = 0.0; self.w_prev = 0.0
@@ -115,7 +116,6 @@ class GoToGoalNode(Node):
         self.get_logger().info(f'BT node up. working_frame="{self.working_frame}". Waiting for goals...')
 
     def odom_cb(self, msg: Odometry):
-        # 'odom'
         if self.working_frame != 'odom':
             return
         p = msg.pose.pose.position; q = msg.pose.pose.orientation
@@ -192,72 +192,44 @@ class GoToGoalNode(Node):
 
 
 class WaitForPose(py_trees.behaviour.Behaviour):
-    def __init__(self, n: GoToGoalNode): super().__init__('Czekaj na pozycje'); self.n=n
+    def __init__(self, n: GoToGoalNode): super().__init__('WaitForPose'); self.n=n
     def update(self): return py_trees.common.Status.SUCCESS if self.n.current_pose else py_trees.common.Status.RUNNING
 
 class WaitForGoal(py_trees.behaviour.Behaviour):
-    def __init__(self, n: GoToGoalNode): super().__init__('Czekaj na cel'); self.n=n
+    def __init__(self, n: GoToGoalNode): super().__init__('WaitForGoal'); self.n=n
     def update(self):
         if self.n.goal_msg is None or self.n.goal_reached:
             self.n.stop(); return py_trees.common.Status.RUNNING
         return py_trees.common.Status.SUCCESS
 
-class EnsureTF(py_trees.behaviour.Behaviour):
-    """Ensure we can compute goal in working frame at least once before moving."""
-    def __init__(self, n: GoToGoalNode): super().__init__('Sprawdz frame'); self.n=n
+class TransformGoal(py_trees.behaviour.Behaviour):
+    """Ensure TF is available once; the controllers still re-transform every tick."""
+    def __init__(self, n: GoToGoalNode): super().__init__('EnsureTF'); self.n=n
     def update(self):
         ok = self.n.goal_in_working_now() is not None
         if ok: return py_trees.common.Status.SUCCESS
         self.n.stop(); return py_trees.common.Status.RUNNING
 
-class Kierunek(py_trees.behaviour.Behaviour):
-    def __init__(self, n: GoToGoalNode): super().__init__('Ustaw kierunek (Yaw)'); self.n=n
+class DriveToGoal(py_trees.behaviour.Behaviour):
+    def __init__(self, n: GoToGoalNode): super().__init__('DriveToGoal'); self.n=n
     def update(self):
         pose = self.n.current_pose
-        goal = self.n.goal_in_working_now()
+        goal = self.n.goal_in_working_now() 
         if pose is None or goal is None:
             self.n.stop(); return py_trees.common.Status.FAILURE
-        x,y,yaw = pose
-        gx,gy = goal.pose.position.x, goal.pose.position.y
-        theta = math.atan2(gy - y, gx - x)
-        alpha = angle_wrap(theta - yaw)
-        if abs(alpha) <= self.n.yaw_tol:
-            self.n.publish_cmd(0.0, 0.0)
-            return py_trees.common.Status.SUCCESS
-        
-        w = self.n.k_alpha * alpha
-        self.n.publish_cmd(0.0, w)
-        return py_trees.common.Status.RUNNING
-
-class Jazda_prosto(py_trees.behaviour.Behaviour):
-    def __init__(self, n: GoToGoalNode): super().__init__('Jazda prosto'); self.n=n
-    def update(self):
-        pose = self.n.current_pose
-        goal = self.n.goal_in_working_now()
-        if pose is None or goal is None:
-            self.n.stop(); return py_trees.common.Status.FAILURE
-        x,y,yaw = pose
-        gx,gy = goal.pose.position.x, goal.pose.position.y
-        dx,dy = gx - x, gy - y
-        rho = math.hypot(dx,dy)
+        x,y,yaw = pose; gx,gy = goal.pose.position.x, goal.pose.position.y
+        dx,dy = gx-x, gy-y; rho = math.hypot(dx,dy)
         if rho <= self.n.pos_tol:
-            self.n.publish_cmd(0.0, 0.0)
-            return py_trees.common.Status.SUCCESS
-        theta = math.atan2(dy, dx)
-        alpha = angle_wrap(theta - yaw)
-        if abs(alpha) > self.n.yaw_tol:
-            self.n.publish_cmd(0.0, 0.0)
-            return py_trees.common.Status.FAILURE
-        # forward only
-        v = self.n.k_rho * rho
-        self.n.publish_cmd(v, 0.0)
-        return py_trees.common.Status.RUNNING
+            self.n.publish_cmd(0.0,0.0); return py_trees.common.Status.SUCCESS
+        theta = math.atan2(dy,dx); alpha = angle_wrap(theta - yaw)
+        v = self.n.k_rho * rho; w = self.n.k_alpha * alpha
+        self.n.publish_cmd(v,w); return py_trees.common.Status.RUNNING
 
 class AlignFinalYaw(py_trees.behaviour.Behaviour):
-    def __init__(self, n: GoToGoalNode): super().__init__('Koryguj ustawienie'); self.n=n
+    def __init__(self, n: GoToGoalNode): super().__init__('AlignFinalYaw'); self.n=n
     def update(self):
         pose = self.n.current_pose
-        goal = self.n.goal_in_working_now()
+        goal = self.n.goal_in_working_now() 
         if pose is None or goal is None:
             self.n.stop(); return py_trees.common.Status.FAILURE
         yaw = pose[2]; yaw_g = yaw_from_quaternion(goal.pose.orientation)
@@ -274,32 +246,12 @@ class Stop(py_trees.behaviour.Behaviour):
 
 
 def make_tree(n: GoToGoalNode) -> py_trees.behaviour.Behaviour:
-    """
-    Root
-      └─ Sequence("Navigate", memory=True)
-           ├─ Czekaj na pozycje
-           ├─ Czekaj na cel
-           ├─ Sprawdz frame
-           ├─ Sequence("Nawiguj do punktu", memory=True)
-           │    ├─ Ustaw kierunek (Yaw)   (rotate in place until facing goal)
-           │    └─ Jazda prosto   (forward only; FAIL if heading drifts)
-           ├─ Koryguj ustawienie        (at goal position)
-           └─ Stop
-    """
     root = py_trees.composites.Sequence(name='Navigate', memory=True)
-    turn_then_drive = py_trees.composites.Sequence(name='Nawiguj do punktu', memory=True)
-
-    wait_pose = WaitForPose(n)
-    wait_goal = WaitForGoal(n)
-    ensure_tf = EnsureTF(n)
-
-    turn = Kierunek(n)
-    drive = Jazda_prosto(n)
-    align = AlignFinalYaw(n)
-    stop  = Stop(n)
-
-    turn_then_drive.add_children([turn, drive])
-    root.add_children([wait_pose, wait_goal, ensure_tf, turn_then_drive, align, stop])
+    approach = py_trees.composites.Sequence(name='ApproachThenAlign', memory=True)
+    wait_pose = WaitForPose(n); wait_goal = WaitForGoal(n); ensure_tf = TransformGoal(n)
+    drive = DriveToGoal(n); align = AlignFinalYaw(n); stop = Stop(n)
+    approach.add_children([drive, align])
+    root.add_children([wait_pose, wait_goal, ensure_tf, approach, stop])
     return root
 
 

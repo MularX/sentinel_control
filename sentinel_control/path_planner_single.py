@@ -4,15 +4,14 @@ import math
 import heapq
 import numpy as np
 
-# ---- FORCE A GUI BACKEND BEFORE importing pyplot (so the window opens) ----
 import matplotlib
 try:
-    matplotlib.use("Qt5Agg")      # needs python3-pyqt5
+    matplotlib.use("Qt5Agg") 
 except Exception:
     try:
-        matplotlib.use("TkAgg")   # needs python3-tk
+        matplotlib.use("TkAgg")
     except Exception:
-        pass  # fall back; if Agg, window won't show (environment issue)
+        pass
 
 import matplotlib.pyplot as plt
 from matplotlib.colors import ListedColormap
@@ -36,7 +35,6 @@ import tf2_ros
 from tf2_ros import TransformException
 from tf2_geometry_msgs.tf2_geometry_msgs import do_transform_pose
 
-# Optional BT viz
 _HAVE_BT = True
 try:
     import py_trees
@@ -62,7 +60,6 @@ class PathPlannerNode(Node):
         except ParameterAlreadyDeclaredException:
             pass
         if not self.get_parameter('use_sim_time').value:
-            # change to True/False to match your system if needed
             self.set_parameters([Parameter('use_sim_time', Parameter.Type.BOOL, True)])
         self.get_logger().info("use_sim_time=True")
 
@@ -72,11 +69,10 @@ class PathPlannerNode(Node):
         self.declare_parameter('goal_reached_radius', 0.35)
         self.declare_parameter('goal_frame', 'auto')   # 'auto'|'map'|'odom'|'base_link'
 
-        # NEW safety-stop params
         self.declare_parameter('safety_stop_enable', True)
         self.declare_parameter('stop_distance_m', 0.10)
-        self.declare_parameter('range_topics', [])     # e.g. ['front_range','rear_range']
-        self.declare_parameter('scan_topics', [])      # e.g. ['/scan']
+        self.declare_parameter('range_topics', [])    
+        self.declare_parameter('scan_topics', [])     
         self.declare_parameter('enable_bt_viz', True)
 
         self.safety_stop_enable: bool = self.get_parameter('safety_stop_enable').value
@@ -86,30 +82,25 @@ class PathPlannerNode(Node):
         self.obstacle_buffer_zone = 5
         self.allow_diagonal = True
 
-        # ---------- TF ----------
         self.tf_buffer = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self, spin_thread=False)
 
-        # ---------- state ----------
         self.map_info = None
         self.map_data_raw = None
         self.costmap_data = None
 
-        self.robot_xy = None  # (x,y) in map frame
+        self.robot_xy = None
         self.path_cells = []
         self.waypoints = []
         self.total_waypoints = 0
         self.awaiting_ack = False
         self.last_sent_wp_grid = None
 
-        # queue a goal if we must escape buffer first
-        self.pending_goal_cell = None  # (c, r) or None
+        self.pending_goal_cell = None
 
-        # Safety stop state
         self.safety_stop_active = False
         self.min_obstacle_distance = None
 
-        # ---------- pubs/subs ----------
         goal_qos = QoSProfile(reliability=ReliabilityPolicy.RELIABLE,
                               durability=DurabilityPolicy.TRANSIENT_LOCAL, depth=1)
         self.pub_goal = self.create_publisher(PoseStamped, '/exploration_goal', goal_qos)
@@ -124,13 +115,11 @@ class PathPlannerNode(Node):
                             durability=DurabilityPolicy.TRANSIENT_LOCAL, depth=10)
         self.sub_ok = self.create_subscription(Bool, '/goal_achieved', self.ok_cb, ok_qos)
 
-        # destination goal
         dest_qos = QoSProfile(reliability=ReliabilityPolicy.RELIABLE,
                               durability=DurabilityPolicy.TRANSIENT_LOCAL, depth=10)
         self.sub_dest = self.create_subscription(PoseStamped, '/destination_goal', self.dest_goal_cb, dest_qos)
         self.get_logger().info("Subscribed to /destination_goal (PoseStamped).")
 
-        # Range & Scan subscriptions (configurable lists)
         self._range_subs = []
         self._scan_subs = []
         for topic in list(self.get_parameter('range_topics').value or []):
@@ -147,7 +136,6 @@ class PathPlannerNode(Node):
         # reset
         self.srv_clear = self.create_service(Empty, '/clear_safety_stop', self._srv_clear_safety_stop)
 
-        # timers
         self.create_timer(0.1, self.pose_tick)
         self.create_timer(0.1, self.plot_tick)
 
@@ -174,7 +162,6 @@ class PathPlannerNode(Node):
 
         self.get_logger().info("PathPlannerNode ready. Click on the map to set a goal, or publish PoseStamped to /destination_goal.")
 
-    # ==================== SAFETY STOP ====================
     def _range_cb(self, msg: Range):
         if not self.safety_stop_enable:
             return
@@ -190,7 +177,6 @@ class PathPlannerNode(Node):
         self._update_min_distance(min(vals))
 
     def _update_min_distance(self, d: float):
-        # Keep a rolling min for info only (no filtering necessary here)
         self.min_obstacle_distance = d
         if not self.safety_stop_active and d <= self.stop_distance_m:
             self._trigger_safety_stop(d)
@@ -200,11 +186,9 @@ class PathPlannerNode(Node):
         self.waypoints.clear()
         self.awaiting_ack = False
         self.last_sent_wp_grid = None
-        # publish latched-like safety flag (depth=1 is enough here)
         msg = Bool(); msg.data = True
         self.pub_safety.publish(msg)
         self.get_logger().warn(f"[SAFETY STOP] Min distance {d:.3f} m <= {self.stop_distance_m:.3f} m. Stopping planner, clearing waypoints.")
-        # From now on, publish_point / plan requests will be ignored until cleared
 
     def _srv_clear_safety_stop(self, req, res):
         self.safety_stop_active = False
@@ -213,9 +197,7 @@ class PathPlannerNode(Node):
         self.pub_safety.publish(msg)
         return res
 
-    # ==================== BT VIZ ====================
     def _bt_setup(self):
-        # Behaviours
         class SafeDistanceBT(py_trees.behaviour.Behaviour):
             def __init__(self, outer):
                 super().__init__(name="SafeDistance")
@@ -237,12 +219,9 @@ class PathPlannerNode(Node):
         root.add_child(PlannerActiveBT(self))
 
         self.bt_tree = py_trees_ros.trees.BehaviourTree(root)
-        # expose services under /pp_bt_tree
         self.bt_tree.setup(node=self, node_name="pp_bt_tree")
-        # tick regularly
         self.bt_tree.tick_tock(period_ms=300)
 
-    # ==================== PLANNING CORE ====================
     def _plan_to_goal_cell(self, goal_c: int, goal_r: int):
         if self.safety_stop_active:
             self.get_logger().warn("stop - przeszkoda w zasiegu")
@@ -315,7 +294,6 @@ class PathPlannerNode(Node):
         self.get_logger().info(f"sciezka z {len(path)} komorek → {self.total_waypoints} punktow")
         self.publish_point()
 
-    # ---------- buffer escape helpers ----------
     def _nudge_out_of_buffer_if_needed(self):
         if self.robot_xy is None or self.costmap_data is None or self.map_info is None:
             return
@@ -338,7 +316,6 @@ class PathPlannerNode(Node):
         )
         self.publish_point()
 
-    # ---------- /destination_goal ----------
     def dest_goal_cb(self, msg: PoseStamped):
         if self.safety_stop_active:
             self.get_logger().warn("Safety stop active — ignoring /destination_goal.")
@@ -348,7 +325,6 @@ class PathPlannerNode(Node):
             self.get_logger().warn("Map not available yet; cannot process /destination_goal.")
             return
 
-        # Transform to map frame if necessary
         try:
             if msg.header.frame_id and msg.header.frame_id != 'map':
                 tf = self.tf_buffer.lookup_transform('map', msg.header.frame_id, Time(),
@@ -365,7 +341,6 @@ class PathPlannerNode(Node):
         goal_c, goal_r = self.world_to_grid(gx_m, gy_m)
         self.get_logger().info(f"Received /destination_goal in map: ({gx_m:.2f}, {gy_m:.2f}) -> grid ({goal_c}, {goal_r})")
 
-        # If currently inside buffer, escape first and queue this goal
         if self.robot_xy is not None:
             sc, sr = self.world_to_grid(*self.robot_xy)
             if not self._is_free(sc, sr):
@@ -411,7 +386,6 @@ class PathPlannerNode(Node):
             self.awaiting_ack = False
             
 
-    # ---------- click to set target ----------
     def on_click(self, event):
         if event.inaxes != self.ax or self.costmap_data is None or self.map_info is None:
             return
@@ -451,7 +425,6 @@ class PathPlannerNode(Node):
 
         self._plan_to_goal_cell(goal_c, goal_r)
 
-    # ---------- progression ----------
     def ok_cb(self, msg: Bool):
         self.get_logger().info(f"/goal_achieved: {msg.data} (awaiting_ack={self.awaiting_ack})")
         if not msg.data:
@@ -460,7 +433,6 @@ class PathPlannerNode(Node):
         if self.awaiting_ack:
             self.advance_wp()
         else:
-            # even if we weren't waiting, escape if we're in buffer
             self._nudge_out_of_buffer_if_needed()
             if not self.waypoints and self.pending_goal_cell is not None:
                 gc, gr = self.pending_goal_cell
@@ -556,7 +528,6 @@ class PathPlannerNode(Node):
             + ("" if frame_used == 'map' else f" -> {frame_used}=({out.pose.position.x:.2f},{out.pose.position.y:.2f})")
         )
 
-    # ---------- pose/plot ----------
     def pose_tick(self):
         try:
             tf = self.tf_buffer.lookup_transform('map', 'base_link', Time(), timeout=Duration(seconds=0.05))
@@ -578,7 +549,6 @@ class PathPlannerNode(Node):
         self.ax.set_title(f'Mapa {self.obstacle_buffer_zone} promien strefy)')
         self.ax.set_xlabel('X '); self.ax.set_ylabel('Y ')
 
-        # draw straight segments robot actually follows
         if self.waypoints:
             if self.robot_xy:
                 rc, rr = self.world_to_grid(*self.robot_xy)
@@ -595,18 +565,11 @@ class PathPlannerNode(Node):
             gx, gy = self.world_to_grid(*self.robot_xy)
             self.ax.plot(gx, gy, 'ro', markersize=6, label='Robot')
 
-        # overlay current min distance + safety status
-        #status = "SAFE" if not self.safety_stop_active else "STOPPED"
-        #md = "n/a" if self.min_obstacle_distance is None else f"{self.min_obstacle_distance:.2f} m"
-        #self.ax.text(0.02, 0.98, f"Safety: {status}\nmin d: {md}\nthr: {self.stop_distance_m:.2f} m",
-                     #transform=self.ax.transAxes, va='top', ha='left', fontsize=9,
-                    # bbox=dict(facecolor='white', alpha=0.6, edgecolor='none'))
 
         if self.ax.get_legend_handles_labels()[1]:
             self.ax.legend(loc='upper right')
         plt.draw(); plt.pause(0.001)
 
-    # ---------- utils / helpers ----------
     def on_motion(self, event):
         if event.inaxes == self.ax and self.map_info and event.xdata is not None and event.ydata is not None:
             col = int(event.xdata); row = int(event.ydata)

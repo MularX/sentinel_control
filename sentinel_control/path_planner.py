@@ -21,6 +21,8 @@ from geometry_msgs.msg import PoseStamped, Pose, Quaternion
 import tf2_ros
 from tf2_ros import TransformException
 from tf2_geometry_msgs.tf2_geometry_msgs import do_transform_pose
+import matplotlib as mpl
+mpl.use('Agg')
 
 
 def yaw_to_quaternion(yaw: float) -> Quaternion:
@@ -30,11 +32,10 @@ def yaw_to_quaternion(yaw: float) -> Quaternion:
     return q
 
 
-class PathPlannerNode(Node):
+class sciezkaPlannerNode(Node):
     def __init__(self):
-        super().__init__('path_planner_node')
+        super().__init__('sciezka_planner_node')
 
-        # ---------- params ----------
         try:
             self.declare_parameter('use_sim_time', True)
         except ParameterAlreadyDeclaredException:
@@ -47,29 +48,25 @@ class PathPlannerNode(Node):
         self.declare_parameter('enable_los_shortcut', True)
         self.declare_parameter('auto_advance_on_proximity', False)
         self.declare_parameter('goal_reached_radius', 0.35)
-        # <<< key switch >>> publish goals in this frame (or auto pick odom if TF present)
-        self.declare_parameter('goal_frame', 'auto')   # 'auto' | 'map' | 'odom' | 'base_link'
+        self.declare_parameter('goal_frame', 'auto')   
 
-        self.obstacle_buffer_zone = 10
+        self.obstacle_buffer_zone = 5  # 10
         self.allow_diagonal = True
 
-        # ---------- TF (main thread only) ----------
         self.tf_buffer = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self, spin_thread=False)
 
-        # ---------- state ----------
         self.map_info = None
         self.map_data_raw = None
         self.costmap_data = None
 
-        self.robot_xy = None  # (x,y) in map frame (queried via TF)
-        self.path_cells = []
+        self.robot_xy = None 
+        self.sciezka_cells = []
         self.waypoints = []
         self.total_wps = 0
         self.awaiting_ack = False
         self.last_sent_wp_grid = None
 
-        # ---------- pubs/subs ----------
         goal_qos = QoSProfile(reliability=ReliabilityPolicy.RELIABLE,
                               durability=DurabilityPolicy.TRANSIENT_LOCAL, depth=1)
         self.pub_goal = self.create_publisher(PoseStamped, '/exploration_goal', goal_qos)
@@ -82,17 +79,14 @@ class PathPlannerNode(Node):
                             durability=DurabilityPolicy.TRANSIENT_LOCAL, depth=10)
         self.sub_ok = self.create_subscription(Bool, '/goal_achieved', self.ok_cb, ok_qos)
 
-        # ---------- subscribe to /destination_goal (PoseStamped) ----------
         dest_qos = QoSProfile(reliability=ReliabilityPolicy.RELIABLE,
                               durability=DurabilityPolicy.TRANSIENT_LOCAL, depth=10)
         self.sub_dest = self.create_subscription(PoseStamped, '/destination_goal', self.dest_goal_cb, dest_qos)
         self.get_logger().info("Subscribed to /destination_goal (PoseStamped).")
 
-        # ---------- timers ----------
-        self.create_timer(0.1, self.pose_tick)   # update robot pose via TF + optional proximity advance
-        self.create_timer(0.1, self.plot_tick)   # draw from main thread
+        self.create_timer(0.1, self.pose_tick)  
+        self.create_timer(0.1, self.plot_tick)  
 
-        # ---------- plot ----------
         plt.ion()
         self.fig, self.ax = plt.subplots(1, 1, figsize=(8, 8))
         self.fig.suptitle('Costmap (click to set target)')
@@ -102,9 +96,8 @@ class PathPlannerNode(Node):
         self.fig.canvas.mpl_connect('motion_notify_event', self.on_motion)
         self.fig.canvas.mpl_connect('button_press_event', self.on_click)
 
-        self.get_logger().info("PathPlannerNode ready. Click on the map to set a goal, or publish PoseStamped to /destination_goal.")
+        self.get_logger().info("sciezkaPlannerNode ready. Click on the map to set a goal, or publish PoseStamped to /destination_goal.")
 
-    # ---------- helper used by click + topic ----------
     def _plan_to_goal_cell(self, goal_c: int, goal_r: int):
         if self.robot_xy is None:
             self.get_logger().warn("Robot pose not available yet.")
@@ -114,7 +107,6 @@ class PathPlannerNode(Node):
             self.get_logger().warn("Map not available yet.")
             return
 
-        # clamp to map bounds
         if not (0 <= goal_c < self.map_info.width and 0 <= goal_r < self.map_info.height):
             self.get_logger().warn("Goal cell outside map bounds.")
             return
@@ -125,18 +117,17 @@ class PathPlannerNode(Node):
             self.get_logger().warn("No free goal near the requested point.")
             return
 
-        path = self._astar((start_c, start_r), (goal_c, goal_r))
-        if not path:
-            self.get_logger().warn("No path found.")
+        sciezka = self._astar((start_c, start_r), (goal_c, goal_r))
+        if not sciezka:
+            self.get_logger().warn("No sciezka found.")
             return
 
-        self.path_cells = path
-        wps = self._simplify_to_corners(path)
+        self.sciezka_cells = sciezka
+        wps = self._simplify_to_corners(sciezka)
         if self.get_parameter('enable_los_shortcut').value:
             wps = self._shortcut_waypoints(wps)
         wps = self._space_waypoints_los(wps)
 
-        # skip start / tiny hop
         if wps and wps[0] == (start_c, start_r):
             wps = wps[1:]
         if wps:
@@ -144,45 +135,40 @@ class PathPlannerNode(Node):
             if math.hypot(wx0 - self.robot_xy[0], wy0 - self.robot_xy[1]) < 0.25:
                 wps = wps[1:]
         if not wps:
-            wps = [path[-1]]
+            wps = [sciezka[-1]]
 
-        # ensure first segment is LOS; else insert farthest visible along path
         if not self._line_of_sight_free((start_c, start_r), wps[0]):
-            for k in range(len(path) - 1, 0, -1):
-                if self._line_of_sight_free((start_c, start_r), path[k]):
-                    wps = [path[k]] + wps
+            for k in range(len(sciezka) - 1, 0, -1):
+                if self._line_of_sight_free((start_c, start_r), sciezka[k]):
+                    wps = [sciezka[k]] + wps
                     break
 
         self.waypoints = wps
         self.total_wps = len(wps)
         self.last_sent_wp_grid = None
         self.awaiting_ack = False
-        self.get_logger().info(f"Planned path with {len(path)} cells → {self.total_wps} waypoints.")
-        self.publish_current_wp()
+        self.get_logger().info(f"Planned sciezka with {len(sciezka)} cells → {self.total_wps} waypoints.")
+        self.publish_currentrent_wp()
 
-    # ---------- NEW: if robot finishes inside buffer, push it out ----------
     def _nudge_out_of_buffer_if_needed(self):
         """
-        If the robot's current grid cell is not free (i.e., in buffer 99 or obstacle 100),
+        If the robot's currentrent grid cell is not free (i.e., in buffer 99 or obstacle 100),
         immediately publish a single escape waypoint to the nearest free cell (0).
         """
         if self.robot_xy is None or self.costmap_data is None or self.map_info is None:
             return
 
         rc, rr = self.world_to_grid(*self.robot_xy)
-        # Check bounds
         if not (0 <= rr < self.costmap_data.shape[0] and 0 <= rc < self.costmap_data.shape[1]):
             return
 
         if self._is_free(rc, rr):
-            return  # already in free space
 
         esc_c, esc_r = self._nearest_free(rc, rr, max_radius=50)
         if esc_c is None:
             self.get_logger().warn("Robot ended in buffer/obstacle but no free cell found nearby.")
             return
 
-        # Set a one-step waypoint and publish right away
         self.waypoints = [(esc_c, esc_r)]
         self.total_wps = 1
         self.last_sent_wp_grid = None
@@ -193,9 +179,8 @@ class PathPlannerNode(Node):
             f"Robot ended inside buffer; nudging to nearest free cell at grid=({esc_c},{esc_r}) "
             f"map=({wx:.2f},{wy:.2f})."
         )
-        self.publish_current_wp()
+        self.publish_currentrent_wp()
 
-    # ---------- /destination_goal callback ----------
     def dest_goal_cb(self, msg: PoseStamped):
         """
         Accept a PoseStamped goal (any frame). Transform to 'map' if needed and plan like a click.
@@ -204,7 +189,6 @@ class PathPlannerNode(Node):
             self.get_logger().warn("Map not available yet; cannot process /destination_goal.")
             return
 
-        # Transform incoming pose into map frame if necessary
         try:
             if msg.header.frame_id and msg.header.frame_id != 'map':
                 tf = self.tf_buffer.lookup_transform('map', msg.header.frame_id, Time(),
@@ -223,7 +207,6 @@ class PathPlannerNode(Node):
 
         self._plan_to_goal_cell(goal_c, goal_r)
 
-    # ---------- map & costmap ----------
     def map_cb(self, msg: OccupancyGrid):
         structure_changed = (
             self.map_info is None or
@@ -245,13 +228,12 @@ class PathPlannerNode(Node):
         self.costmap_data = cm
 
         if structure_changed:
-            self.path_cells.clear()
+            self.sciezka_cells.clear()
             self.waypoints.clear()
             self.total_wps = 0
             self.last_sent_wp_grid = None
             self.awaiting_ack = False
 
-    # ---------- click to set target ----------
     def on_click(self, event):
         if event.inaxes != self.ax or self.costmap_data is None or self.map_info is None:
             return
@@ -273,18 +255,17 @@ class PathPlannerNode(Node):
             self.get_logger().warn("No free goal near the clicked point.")
             return
 
-        path = self._astar((start_c, start_r), (goal_c, goal_r))
-        if not path:
-            self.get_logger().warn("No path found.")
+        sciezka = self._astar((start_c, start_r), (goal_c, goal_r))
+        if not sciezka:
+            self.get_logger().warn("No sciezka found.")
             return
 
-        self.path_cells = path
-        wps = self._simplify_to_corners(path)
+        self.sciezka_cells = sciezka
+        wps = self._simplify_to_corners(sciezka)
         if self.get_parameter('enable_los_shortcut').value:
             wps = self._shortcut_waypoints(wps)
         wps = self._space_waypoints_los(wps)
 
-        # skip start / tiny hop
         if wps and wps[0] == (start_c, start_r):
             wps = wps[1:]
         if wps:
@@ -292,23 +273,21 @@ class PathPlannerNode(Node):
             if math.hypot(wx0 - self.robot_xy[0], wy0 - self.robot_xy[1]) < 0.25:
                 wps = wps[1:]
         if not wps:
-            wps = [path[-1]]
+            wps = [sciezka[-1]]
 
-        # ensure first segment is LOS; else insert farthest visible along path
         if not self._line_of_sight_free((start_c, start_r), wps[0]):
-            for k in range(len(path) - 1, 0, -1):
-                if self._line_of_sight_free((start_c, start_r), path[k]):
-                    wps = [path[k]] + wps
+            for k in range(len(sciezka) - 1, 0, -1):
+                if self._line_of_sight_free((start_c, start_r), sciezka[k]):
+                    wps = [sciezka[k]] + wps
                     break
 
         self.waypoints = wps
         self.total_wps = len(wps)
         self.last_sent_wp_grid = None
         self.awaiting_ack = False
-        self.get_logger().info(f"Planned path with {len(path)} cells → {self.total_wps} waypoints.")
-        self.publish_current_wp()
+        self.get_logger().info(f"Planned sciezka with {len(sciezka)} cells → {self.total_wps} waypoints.")
+        self.publish_currentrent_wp()
 
-    # ---------- progression ----------
     def ok_cb(self, msg: Bool):
         self.get_logger().info(f"/goal_achieved: {msg.data} (awaiting_ack={self.awaiting_ack})")
         if msg.data and self.awaiting_ack:
@@ -323,13 +302,12 @@ class PathPlannerNode(Node):
         self.last_sent_wp_grid = None
         self.awaiting_ack = False
         if self.waypoints:
-            self.publish_current_wp()
+            self.publish_currentrent_wp()
         else:
-            self.get_logger().info("Path complete.")
-            # >>> NEW: if we finished but we're sitting in buffer/obstacle, nudge out now
+            self.get_logger().info("sciezka complete.")
             self._nudge_out_of_buffer_if_needed()
 
-    def publish_current_wp(self):
+    def publish_currentrent_wp(self):
         if not self.waypoints:
             self.get_logger().info("No more goals.")
             self.awaiting_ack = False
@@ -341,7 +319,6 @@ class PathPlannerNode(Node):
             return
         self.last_sent_wp_grid = (gx, gy)
 
-        # pose in MAP first
         wx_m, wy_m = self.grid_to_world(gx, gy)
         if len(self.waypoints) >= 2:
             nx_m, ny_m = self.grid_to_world(*self.waypoints[1])
@@ -357,7 +334,6 @@ class PathPlannerNode(Node):
         ps_map.pose.position.z = 0.0
         ps_map.pose.orientation = yaw_to_quaternion(yaw_m)
 
-        # decide frame to publish
         target = self.get_parameter('goal_frame').get_parameter_value().string_value or 'auto'
         frame_used = 'map'
         out = ps_map
@@ -382,7 +358,6 @@ class PathPlannerNode(Node):
                 out.pose = pose
                 frame_used = 'base_link'
             else:
-                # auto but no map->odom: keep map
                 pass
         except TransformException as ex:
             self.get_logger().warn(f"TF transform to '{target}' failed ({ex}), publishing in 'map'.")
@@ -396,9 +371,7 @@ class PathPlannerNode(Node):
             + ("" if frame_used == 'map' else f" -> {frame_used}=({out.pose.position.x:.2f},{out.pose.position.y:.2f})")
         )
 
-    # ---------- pose/plot ----------
     def pose_tick(self):
-        # always try to get global pose via TF: map->base_link (works for AMCL & SLAM)
         try:
             tf = self.tf_buffer.lookup_transform('map', 'base_link', Time(), timeout=Duration(seconds=0.05))
             self.robot_xy = (tf.transform.translation.x, tf.transform.translation.y)
@@ -419,18 +392,17 @@ class PathPlannerNode(Node):
         self.ax.set_title(f'Costmap (buffer {self.obstacle_buffer_zone} cells)')
         self.ax.set_xlabel('X (cells)'); self.ax.set_ylabel('Y (cells)')
 
-        # draw straight segments robot actually follows
         if self.waypoints:
             if self.robot_xy:
                 rc, rr = self.world_to_grid(*self.robot_xy)
                 w0c, w0r = self.waypoints[0]
-                self.ax.plot([rc, w0c], [rr, w0r], '-', linewidth=2, label='Path')
+                self.ax.plot([rc, w0c], [rr, w0r], '-', linewidth=2, label='sciezka')
             for i in range(len(self.waypoints)-1):
                 c0, r0 = self.waypoints[i]; c1, r1 = self.waypoints[i+1]
                 self.ax.plot([c0, c1], [r0, r1], '-', linewidth=2)
             wx = [w[0] for w in self.waypoints]; wy = [w[1] for w in self.waypoints]
             self.ax.plot(wx, wy, 'b*', markersize=10, label='Remaining WPs')
-            self.ax.plot(self.waypoints[0][0], self.waypoints[0][1], 'r*', markersize=14, label='Current WP')
+            self.ax.plot(self.waypoints[0][0], self.waypoints[0][1], 'r*', markersize=14, label='currentrent WP')
 
         if self.robot_xy:
             gx, gy = self.world_to_grid(*self.robot_xy)
@@ -445,9 +417,8 @@ class PathPlannerNode(Node):
             col = int(event.xdata); row = int(event.ydata)
             if 0 <= col < self.map_info.width and 0 <= row < self.map_info.height:
                 mx, my = self.grid_to_world(col, row)
-                self.fig.suptitle(f'Cursor: [row: {row}, col: {col}] | Map (x: {mx:.2f}m, y: {my:.2f}m)')
+                self.fig.suptitle(f'currentsor: [row: {row}, col: {col}] | Map (x: {mx:.2f}m, y: {my:.2f}m)')
 
-    # ---------- planning helpers ----------
     def grid_to_world(self, c, r):
         x = self.map_info.origin.position.x + (c + 0.5) * self.map_info.resolution
         y = self.map_info.origin.position.y + (r + 0.5) * self.map_info.resolution
@@ -490,24 +461,32 @@ class PathPlannerNode(Node):
 
     def _astar(self, start, goal):
         sc, sr = start; gc, gr = goal
-        if not self._is_free(sc, sr) or not self._is_free(gc, gr): return []
+        if not self._is_free(sc, sr) or not self._is_free(gc, gr):
+            return []
+
         open_set = [(0.0, start)]
         came = {}; g = {start: 0.0}
         def h(a,b): return math.hypot(a[0]-b[0], a[1]-b[1])
-        closed = set()
+        closed = set()  
+
         while open_set:
-            _, cur = heapq.heappop(open_set)
-            if cur in closed: continue
-            if cur == goal:
-                path = [cur]
-                while cur in came:
-                    cur = came[cur]; path.append(cur)
-                path.reverse(); return path
-            closed.add(cur)
-            for (nbr, cost) in self._neighbors(*cur):
-                t = g[cur] + cost
+            _, current = heapq.heappop(open_set)
+            if current in closed: 
+                    continue
+
+            if current == goal:
+                sciezka = [current]
+                while current in came:
+                    current = came[current]
+                    sciezka.append(current)
+                sciezka.reverse()
+                return sciezka
+            
+            closed.add(current)
+            for (nbr, cost) in self._neighbors(*current):
+                t = g[current] + cost
                 if nbr in g and t >= g[nbr]: continue
-                came[nbr] = cur; g[nbr] = t
+                came[nbr] = current; g[nbr] = t
                 heapq.heappush(open_set, (t + h(nbr, goal), nbr))
         return []
 
@@ -527,18 +506,18 @@ class PathPlannerNode(Node):
             if not self._is_free(c, r): return False
         return True
 
-    def _simplify_to_corners(self, path_cells):
-        if len(path_cells) <= 2: return path_cells[:]
-        out = [path_cells[0]]
-        prev, curr = path_cells[0], path_cells[1]
+    def _simplify_to_corners(self, sciezka_cells):
+        if len(sciezka_cells) <= 2: return sciezka_cells[:]
+        out = [sciezka_cells[0]]
+        prev, currentr = sciezka_cells[0], sciezka_cells[1]
         def nrm(d): dx,dy=d; return (0 if dx==0 else int(dx/abs(dx)), 0 if dy==0 else int(dy/abs(dy)))
-        prev_dir = (curr[0]-prev[0], curr[1]-prev[1])
-        for i in range(2, len(path_cells)):
-            nxt = path_cells[i]
-            cur_dir = (nxt[0]-curr[0], nxt[1]-curr[1])
-            if nrm(cur_dir) != nrm(prev_dir): out.append(curr)
-            prev, curr, prev_dir = curr, nxt, cur_dir
-        out.append(path_cells[-1]); return out
+        prev_dir = (currentr[0]-prev[0], currentr[1]-prev[1])
+        for i in range(2, len(sciezka_cells)):
+            nxt = sciezka_cells[i]
+            current_dir = (nxt[0]-currentr[0], nxt[1]-currentr[1])
+            if nrm(current_dir) != nrm(prev_dir): out.append(currentr)
+            prev, currentr, prev_dir = currentr, nxt, current_dir
+        out.append(sciezka_cells[-1]); return out
 
     def _shortcut_waypoints(self, wps):
         if len(wps) <= 2: return wps[:]
@@ -571,10 +550,10 @@ class PathPlannerNode(Node):
 def main():
     try:
         rclpy.init()
-        node = PathPlannerNode()
+        node = sciezkaPlannerNode()
         rclpy.spin(node)
     except Exception as e:
-        print(f"[path_planner] Fatal error: {e}")
+        print(f"[sciezka_planner] Fatal error: {e}")
         raise
     except KeyboardInterrupt:
         pass
