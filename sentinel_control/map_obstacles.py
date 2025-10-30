@@ -18,18 +18,18 @@ class MapDisplayNode(Node):
     def __init__(self):
         super().__init__('map_display_node')
 
-        # --- PARAMETRY PLANOWANIA ---
+
         self.pole_przeszkody = 10
-        self.min_klaster_rozmiar_pocz = 20 # Początkowy, wysoki próg
+        self.min_klaster_rozmiar_pocz = 20 # Poczatkowy, wysoki prog
         self.min_klaster_rozmiar = self.min_klaster_rozmiar_pocz
         self.kara_za_odleglosc = 2.5 
 
-        # --- NOWE ZMIENNE STANU ---
-        self.exploration_phase = 1 # Faza 1: Główne cele. Faza 2: Mniejsze cele.
-        self.mission_completed = False
-        self.initial_robot_position = None # Zapiszemy tu (x, y) w układzie 'map'
 
-        # --- ZMIENNE DO WYKRYWANIA UTKNIĘCIA ---
+        self.exploration_phase = 1 
+        self.mission_completed = False
+        self.initial_robot_position = None 
+
+      
         self.stuck_check_interval = 1.0
         self.stuck_timeout = 5.0
         self.last_known_position = None
@@ -96,17 +96,16 @@ class MapDisplayNode(Node):
         to_frame = 'base_link'
 
         try:
-            # Użyj czasu z wiadomości, aby uniknąć błędów ekstrapolacji
+            
             t = self.tf_buffer.lookup_transform(from_frame, to_frame, msg.header.stamp)
             self.robot_x = t.transform.translation.x
             self.robot_y = t.transform.translation.y
 
-            # --- NOWOŚĆ: Zapisz pozycję startową robota (tylko raz) ---
+            
             if self.initial_robot_position is None:
                 self.initial_robot_position = (self.robot_x, self.robot_y)
                 self.get_logger().info(f"Zapisano pozycję startową robota: {self.initial_robot_position}")
-            # Aby zablokować aktualizację pozycji startowej, po prostu zakomentuj powyższy blok if.
-            # LUB: if self.initial_robot_position is None and WARUNEK_DO_ZAPISU: ...
+         
 
             if self.exploration_points and self.map_info:
                 goal_x, goal_y = self.exploration_points[0]
@@ -189,9 +188,9 @@ class MapDisplayNode(Node):
     def update_and_publish_costmap(self):
         if self.map_data_raw is None: return
         
-        # --- NOWOŚĆ: Wypełnianie dziur w przeszkodach ---
+
         obstacle_mask = (self.map_data_raw == 100)
-        # binary_fill_holes wypełnia dziury wewnątrz obiektów
+
         filled_obstacle_mask = binary_fill_holes(obstacle_mask)
 
         struct_element = np.ones((2 * self.pole_przeszkody + 1, 2 * self.pole_przeszkody + 1))
@@ -216,7 +215,7 @@ class MapDisplayNode(Node):
         if not frontier_points: return []
         
         clusters = []; visited = set(frontier_points); q = deque()
-        # Optymalizacja: użyj zbioru do szybszego sprawdzania
+
         points_to_visit = set(frontier_points)
         
         for point in frontier_points:
@@ -240,7 +239,7 @@ class MapDisplayNode(Node):
                 if map_data[centroid_y, centroid_x] == 0:
                     targets_with_utility_info.append(((centroid_x, centroid_y), len(cluster)))
                 else:
-                    # Znajdź najbliższy bezpieczny punkt z klastra
+
                     safe_point = min(cluster, key=lambda p: (p[0]-centroid_x)**2 + (p[1]-centroid_y)**2)
                     targets_with_utility_info.append((safe_point, len(cluster)))
         
@@ -251,14 +250,14 @@ class MapDisplayNode(Node):
         self.last_known_position = None
         
         if not self.exploration_points:
-            # --- NOWA LOGIKA KOŃCA MISJI ---
+
             if self.exploration_phase == 1:
                 self.get_logger().warn("Faza 1 zakończona. Brak dużych celów. Przechodzę do Fazy 2 (mniejsze cele).")
                 self.exploration_phase = 2
-                self.min_klaster_rozmiar = int(self.min_klaster_rozmiar_pocz / 2) # Obniż próg
-                self.replan_and_sort_goals() # Spróbuj zaplanować jeszcze raz
+                self.min_klaster_rozmiar = int(self.min_klaster_rozmiar_pocz / 2) # 
+                self.replan_and_sort_goals()
                 return
-            else: # Jesteśmy w fazie 2 i nie ma już celów
+            else: 
                 self.get_logger().info("Faza 2 zakończona. Brak dalszych celów do eksploracji.")
                 if self.initial_robot_position:
                     self.get_logger().info(f"Misja eksploracji zakończona! Wysyłam robota do punktu startowego: {self.initial_robot_position}")
