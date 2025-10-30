@@ -28,7 +28,7 @@ setup(
             'path_planner_single  = sentinel_control.path_planner_single:main',
             'navigate_bt_fast   = sentinel_control.navigate_bt_fast:main',
             'map_obstacles_fast = sentinel_control.map_obstacles_fast:main',
-            'path_planner_grey  = sentinel_control.path_planne_grey:main',
+            #'path_planner_grey  = sentinel_control.path_planne_grey:main',
             ]
     },
 )
