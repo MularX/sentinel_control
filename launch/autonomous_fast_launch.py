@@ -1,4 +1,3 @@
-
 from launch import LaunchDescription
 from launch.actions import RegisterEventHandler, TimerAction
 from launch.event_handlers import OnProcessStart
@@ -15,17 +14,18 @@ def generate_launch_description():
 
     path_planner = Node(
         package='sentinel_control',
-        executable='path_planner',
+        executable='path_planner_grey',
         name='path_planner',
         output='screen'
     )
 
     map = Node(
         package='sentinel_control',
-        executable='map_obstacles',
+        executable='map_obstacles_fast',
         name='map',
         output='screen'
     )
+
 
     path_planner_after_navigate = RegisterEventHandler(
         OnProcessStart(
@@ -33,6 +33,7 @@ def generate_launch_description():
             on_start=[path_planner],
         )
     )
+
 
     map_after_path_planner = RegisterEventHandler(
         OnProcessStart(
